@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/pool"
+	"github.com/gotd/td/rpc"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/uploader"
@@ -22,6 +24,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 // configSession stores the MTProto session in the rclone config.
@@ -47,20 +50,22 @@ func (s *configSession) StoreSession(_ context.Context, data []byte) error {
 	return nil
 }
 
-// retryMiddleware waits out FLOOD_WAIT and retries transient server errors.
+// retryMiddleware waits out FLOOD_WAIT and retries transient server and
+// network errors. Sends carry a fixed random_id, so a retry cannot post
+// the same message twice.
 func retryMiddleware(maxRetries int) telegram.Middleware {
 	return telegram.MiddlewareFunc(func(next tg.Invoker) telegram.InvokeFunc {
 		return func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
 			backoff := time.Second
 			for attempt := 0; ; attempt++ {
 				err := next.Invoke(ctx, in, out)
-				if err == nil || attempt >= maxRetries {
+				if err == nil || attempt >= maxRetries || ctx.Err() != nil {
 					return err
 				}
 				var wait time.Duration
 				if d, ok := tgerr.AsFloodWait(err); ok {
 					wait = d + time.Second
-				} else if rpcErr, ok := tgerr.As(err); ok && (rpcErr.Code >= 500 || rpcErr.Code == -503) {
+				} else if rpcErr, ok := tgerr.As(err); (ok && (rpcErr.Code >= 500 || rpcErr.Code == -503)) || isNetworkError(err) {
 					wait, backoff = backoff, min(backoff*2, 30*time.Second)
 				} else {
 					return err
@@ -74,6 +79,19 @@ func retryMiddleware(maxRetries int) telegram.Middleware {
 			}
 		}
 	})
+}
+
+// isNetworkError reports whether err is a dropped connection or another
+// network failure that is worth retrying. RPC errors are not: the server
+// answered.
+func isNetworkError(err error) bool {
+	if _, ok := tgerr.As(err); ok {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, pool.ErrConnDead) || errors.Is(err, rpc.ErrEngineClosed) || fserrors.ShouldRetry(err)
 }
 
 func connect(ctx context.Context, opt *Options, m configmap.Mapper) (*telegram.Client, error) {
