@@ -73,7 +73,7 @@ jobs:
       # Manual test runs build only, without attesting.
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.*z*
       - uses: actions/upload-artifact@v7
