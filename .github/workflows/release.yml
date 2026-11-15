@@ -1,0 +1,103 @@
+name: Release
+
+# Pushing a v* tag builds every target and publishes a GitHub release.
+# Running it manually (workflow_dispatch) only builds, for testing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    # Signs a build provenance attestation for each archive (Sigstore,
+    # keyless). Verify with: gh attestation verify <file> -R <owner>/<repo>
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux mounts with pure Go, no cgo needed.
+          - { os: ubuntu-latest, goos: linux, goarch: amd64, cgo: "0", tags: "" }
+          - { os: ubuntu-latest, goos: linux, goarch: arm64, cgo: "0", tags: "" }
+          - { os: ubuntu-latest, goos: linux, goarch: arm, goarm: "7", cgo: "0", tags: "" }
+          # Windows mounts through WinFsp without cgo.
+          - { os: ubuntu-latest, goos: windows, goarch: amd64, cgo: "0", tags: cmount }
+          - { os: ubuntu-latest, goos: windows, goarch: arm64, cgo: "0", tags: cmount }
+          # FreeBSD: no mount (needs cgo against FreeBSD libfuse).
+          - { os: ubuntu-latest, goos: freebsd, goarch: amd64, cgo: "0", tags: "" }
+          # macOS mounts need cgo + FUSE headers, so build natively.
+          - { os: macos-latest, goos: darwin, goarch: arm64, cgo: "1", tags: cmount }
+          - { os: macos-latest, goos: darwin, goarch: amd64, cgo: "1", tags: cmount, cc: "clang -arch x86_64" }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install macFUSE headers
+        if: matrix.goos == 'darwin'
+        run: brew install --cask macfuse
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
+        run: |
+          VERSION=$(git describe --tags --always)
+          NAME=rclone-telegram-${VERSION}-${GOOS}-${GOARCH}${GOARM:+v$GOARM}
+          EXT=""; [ "$GOOS" = windows ] && EXT=".exe"
+          [ -z "$CC" ] && unset CC
+          mkdir -p "dist/$NAME"
+          go build -trimpath -tags "${{ matrix.tags }}" \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/$NAME/rclone-telegram$EXT" .
+          cp LICENSE README.md "dist/$NAME/"
+          cd dist
+          if [ "$GOOS" = windows ]; then
+            7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+          fi
+      # Manual test runs build only, without attesting.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.*z*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: dist/*.*z*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

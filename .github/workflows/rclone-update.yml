@@ -1,0 +1,75 @@
+name: Track rclone releases
+
+# Daily: for every rclone release published since the last run, bump the
+# dependency, run the tests, commit, tag the matching version and trigger
+# the release build. A failing test stops the run; the next run retries.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the commit and tag
+  actions: write # dispatch the release workflow
+
+concurrency:
+  group: rclone-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Find new rclone releases
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(go list -m -f '{{.Version}}' github.com/rclone/rclone)
+          # Every stable release newer than the current one, oldest first,
+          # so none is skipped when several came out since the last run.
+          # Patches to older rclone lines are not built.
+          pending=$(gh api 'repos/rclone/rclone/releases?per_page=30' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            while read -r t; do
+              newest=$(printf '%s\n%s\n' "$current" "$t" | sort -V | tail -n1)
+              if [ "$t" != "$current" ] && [ "$newest" = "$t" ]; then echo "$t"; fi
+            done | sort -V | tr '\n' ' ')
+          echo "current=$current pending=${pending:-none}"
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+
+      - name: Update, test, tag and release each one
+        if: steps.v.outputs.pending != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOTOOLCHAIN: auto # newer rclone may need a newer Go
+          PENDING: ${{ steps.v.outputs.pending }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for rclone in $PENDING; do
+            echo "::group::rclone $rclone"
+            go get "github.com/rclone/rclone@$rclone"
+            go mod tidy
+            go vet ./...
+            go test ./...
+            go build ./...
+            git commit -am "Update rclone to $rclone"
+
+            next=$(./scripts/next-version.sh)
+            git tag -a "$next" -m "Built on rclone $rclone"
+            git push origin HEAD:main "$next"
+
+            # Tags pushed with GITHUB_TOKEN do not trigger workflows,
+            # but workflow_dispatch does.
+            gh workflow run release.yml --ref "$next"
+            echo "Released $next (rclone $rclone)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done

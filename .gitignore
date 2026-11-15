@@ -1,0 +1,4 @@
+/rclone-telegram
+/dist/
+*.so
+*.conf
